@@ -138,7 +138,7 @@ i40e_pf_host_vf_reset(struct i40e_pf_vf *vf, bool do_hw_reset)
 	abs_vf_id = vf_id + hw->func_caps.vf_base_id;
 
 	/* Notify VF that we are in VFR progress */
-	I40E_WRITE_REG(hw, I40E_VFGEN_RSTAT1(vf_id), I40E_PF_VFR_INPROGRESS);
+	I40E_WRITE_REG(hw, I40E_VFGEN_RSTAT1(vf_id), I40E_VFR_INPROGRESS);
 
 	/*
 	 * If require a SW VF reset, a VFLR interrupt will be generated,
@@ -219,7 +219,7 @@ i40e_pf_host_vf_reset(struct i40e_pf_vf *vf, bool do_hw_reset)
 	}
 
 	/* Reset done, Set COMPLETE flag and clear reset bit */
-	I40E_WRITE_REG(hw, I40E_VFGEN_RSTAT1(vf_id), I40E_PF_VFR_COMPLETED);
+	I40E_WRITE_REG(hw, I40E_VFGEN_RSTAT1(vf_id), I40E_VFR_COMPLETED);
 	val = I40E_READ_REG(hw, I40E_VPGEN_VFRTRIG(vf_id));
 	val &= ~I40E_VPGEN_VFRTRIG_VFSWR_MASK;
 	I40E_WRITE_REG(hw, I40E_VPGEN_VFRTRIG(vf_id), val);
@@ -246,6 +246,8 @@ i40e_pf_host_vf_reset(struct i40e_pf_vf *vf, bool do_hw_reset)
 		i40e_vsi_release(vf->vsi);
 		return -EFAULT;
 	}
+
+	I40E_WRITE_REG(hw, I40E_VFGEN_RSTAT1(vf_id), I40E_VFR_VFACTIVE);
 
 	return ret;
 }
@@ -904,11 +906,11 @@ i40e_notify_vf_link_status(struct rte_eth_dev *dev, struct i40e_pf_vf *vf)
 
 	event.event = I40E_VIRTCHNL_EVENT_LINK_CHANGE;
 	event.event_data.link_event.link_status =
-			dev->data->dev_link.link_status;
+		dev->data->dev_link.link_status;
 	event.event_data.link_event.link_speed =
-			(enum i40e_aq_link_speed)dev->data->dev_link.link_speed;
+		(enum i40e_aq_link_speed)dev->data->dev_link.link_speed;
 	i40e_pf_host_send_msg_to_vf(vf, I40E_VIRTCHNL_OP_EVENT,
-			I40E_SUCCESS, (uint8_t *)&event, sizeof(event));
+		I40E_SUCCESS, (uint8_t *)&event, sizeof(event));
 }
 
 void

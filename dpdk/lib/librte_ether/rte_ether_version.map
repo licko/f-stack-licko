@@ -19,7 +19,6 @@ DPDK_2.2 {
 	rte_eth_dev_bypass_ver_show;
 	rte_eth_dev_bypass_wd_reset;
 	rte_eth_dev_bypass_wd_timeout_show;
-	rte_eth_dev_callback_process;
 	rte_eth_dev_callback_register;
 	rte_eth_dev_callback_unregister;
 	rte_eth_dev_close;
@@ -78,7 +77,6 @@ DPDK_2.2 {
 	rte_eth_dev_vlan_filter;
 	rte_eth_dev_wd_timeout_store;
 	rte_eth_dma_zone_reserve;
-	rte_eth_driver_register;
 	rte_eth_led_off;
 	rte_eth_led_on;
 	rte_eth_link;
@@ -138,4 +136,13 @@ DPDK_16.07 {
 	rte_eth_dev_get_name_by_port;
 	rte_eth_dev_get_port_by_name;
 	rte_eth_xstats_get_names;
+
 } DPDK_16.04;
+
+DPDK_16.11 {
+	global:
+
+	rte_eth_dev_pci_probe;
+	rte_eth_dev_pci_remove;
+
+} DPDK_16.07;

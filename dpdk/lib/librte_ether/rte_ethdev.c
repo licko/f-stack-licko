@@ -58,7 +58,6 @@
 #include <rte_atomic.h>
 #include <rte_branch_prediction.h>
 #include <rte_common.h>
-#include <rte_ring.h>
 #include <rte_mempool.h>
 #include <rte_malloc.h>
 #include <rte_mbuf.h>
@@ -72,6 +71,7 @@
 static const char *MZ_RTE_ETH_DEV_DATA = "rte_eth_dev_data";
 struct rte_eth_dev rte_eth_devices[RTE_MAX_ETHPORTS];
 static struct rte_eth_dev_data *rte_eth_dev_data;
+static uint8_t eth_dev_last_created_port;
 static uint8_t nb_ports;
 
 /* spinlock for eth device callbacks */
@@ -189,8 +189,22 @@ rte_eth_dev_find_free_port(void)
 	return RTE_MAX_ETHPORTS;
 }
 
+static struct rte_eth_dev *
+eth_dev_get(uint8_t port_id)
+{
+	struct rte_eth_dev *eth_dev = &rte_eth_devices[port_id];
+
+	eth_dev->data = &rte_eth_dev_data[port_id];
+	eth_dev->attached = DEV_ATTACHED;
+
+	eth_dev_last_created_port = port_id;
+	nb_ports++;
+
+	return eth_dev;
+}
+
 struct rte_eth_dev *
-rte_eth_dev_allocate(const char *name, enum rte_eth_dev_type type)
+rte_eth_dev_allocate(const char *name)
 {
 	uint8_t port_id;
 	struct rte_eth_dev *eth_dev;
@@ -210,28 +224,42 @@ rte_eth_dev_allocate(const char *name, enum rte_eth_dev_type type)
 		return NULL;
 	}
 
-	eth_dev = &rte_eth_devices[port_id];
-	eth_dev->data = &rte_eth_dev_data[port_id];
+	eth_dev = eth_dev_get(port_id);
 	snprintf(eth_dev->data->name, sizeof(eth_dev->data->name), "%s", name);
 	eth_dev->data->port_id = port_id;
-	eth_dev->attached = DEV_ATTACHED;
-	eth_dev->dev_type = type;
-	nb_ports++;
+
 	return eth_dev;
 }
 
-static int
-rte_eth_dev_create_unique_device_name(char *name, size_t size,
-		struct rte_pci_device *pci_dev)
+/*
+ * Attach to a port already registered by the primary process, which
+ * makes sure that the same device would have the same port id both
+ * in the primary and secondary process.
+ */
+static struct rte_eth_dev *
+eth_dev_attach_secondary(const char *name)
 {
-	int ret;
+	uint8_t i;
+	struct rte_eth_dev *eth_dev;
 
-	ret = snprintf(name, size, "%d:%d.%d",
-			pci_dev->addr.bus, pci_dev->addr.devid,
-			pci_dev->addr.function);
-	if (ret < 0)
-		return ret;
-	return 0;
+	if (rte_eth_dev_data == NULL)
+		rte_eth_dev_data_alloc();
+
+	for (i = 0; i < RTE_MAX_ETHPORTS; i++) {
+		if (strcmp(rte_eth_dev_data[i].name, name) == 0)
+			break;
+	}
+	if (i == RTE_MAX_ETHPORTS) {
+		RTE_PMD_DEBUG_TRACE(
+			"device %s is not driven by the primary process\n",
+			name);
+		return NULL;
+	}
+
+	eth_dev = eth_dev_get(i);
+	RTE_ASSERT(eth_dev->data->port_id == i);
+
+	return eth_dev;
 }
 
 int
@@ -245,9 +273,9 @@ rte_eth_dev_release_port(struct rte_eth_dev *eth_dev)
 	return 0;
 }
 
-static int
-rte_eth_dev_init(struct rte_pci_driver *pci_drv,
-		 struct rte_pci_device *pci_dev)
+int
+rte_eth_dev_pci_probe(struct rte_pci_driver *pci_drv,
+		      struct rte_pci_device *pci_dev)
 {
 	struct eth_driver    *eth_drv;
 	struct rte_eth_dev *eth_dev;
@@ -257,20 +285,31 @@ rte_eth_dev_init(struct rte_pci_driver *pci_drv,
 
 	eth_drv = (struct eth_driver *)pci_drv;
 
-	/* Create unique Ethernet device name using PCI address */
-	rte_eth_dev_create_unique_device_name(ethdev_name,
-			sizeof(ethdev_name), pci_dev);
-
-	eth_dev = rte_eth_dev_allocate(ethdev_name, RTE_ETH_DEV_PCI);
-	if (eth_dev == NULL)
-		return -ENOMEM;
+	rte_eal_pci_device_name(&pci_dev->addr, ethdev_name,
+			sizeof(ethdev_name));
 
 	if (rte_eal_process_type() == RTE_PROC_PRIMARY) {
+		eth_dev = rte_eth_dev_allocate(ethdev_name);
+		if (eth_dev == NULL)
+			return -ENOMEM;
+
 		eth_dev->data->dev_private = rte_zmalloc("ethdev private structure",
 				  eth_drv->dev_private_size,
 				  RTE_CACHE_LINE_SIZE);
 		if (eth_dev->data->dev_private == NULL)
 			rte_panic("Cannot allocate memzone for private port data\n");
+	} else {
+		eth_dev = eth_dev_attach_secondary(ethdev_name);
+		if (eth_dev == NULL) {
+			/*
+			 * if we failed to attach a device, it means the
+			 * device is skipped in primary process, due to
+			 * some errors. If so, we return a positive value,
+			 * to let EAL skip it for the secondary process
+			 * as well.
+			 */
+			return 1;
+		}
 	}
 	eth_dev->pci_dev = pci_dev;
 	eth_dev->driver = eth_drv;
@@ -290,7 +329,7 @@ rte_eth_dev_init(struct rte_pci_driver *pci_drv,
 		return 0;
 
 	RTE_PMD_DEBUG_TRACE("driver %s: eth_dev_init(vendor_id=0x%x device_id=0x%x) failed\n",
-			pci_drv->name,
+			pci_drv->driver.name,
 			(unsigned) pci_dev->id.vendor_id,
 			(unsigned) pci_dev->id.device_id);
 	if (rte_eal_process_type() == RTE_PROC_PRIMARY)
@@ -299,8 +338,8 @@ rte_eth_dev_init(struct rte_pci_driver *pci_drv,
 	return diag;
 }
 
-static int
-rte_eth_dev_uninit(struct rte_pci_device *pci_dev)
+int
+rte_eth_dev_pci_remove(struct rte_pci_device *pci_dev)
 {
 	const struct eth_driver *eth_drv;
 	struct rte_eth_dev *eth_dev;
@@ -310,9 +349,8 @@ rte_eth_dev_uninit(struct rte_pci_device *pci_dev)
 	if (pci_dev == NULL)
 		return -EINVAL;
 
-	/* Create unique Ethernet device name using PCI address */
-	rte_eth_dev_create_unique_device_name(ethdev_name,
-			sizeof(ethdev_name), pci_dev);
+	rte_eal_pci_device_name(&pci_dev->addr, ethdev_name,
+			sizeof(ethdev_name));
 
 	eth_dev = rte_eth_dev_allocated(ethdev_name);
 	if (eth_dev == NULL)
@@ -340,28 +378,6 @@ rte_eth_dev_uninit(struct rte_pci_device *pci_dev)
 	return 0;
 }
 
-/**
- * Register an Ethernet [Poll Mode] driver.
- *
- * Function invoked by the initialization function of an Ethernet driver
- * to simultaneously register itself as a PCI driver and as an Ethernet
- * Poll Mode Driver.
- * Invokes the rte_eal_pci_register() function to register the *pci_drv*
- * structure embedded in the *eth_drv* structure, after having stored the
- * address of the rte_eth_dev_init() function in the *devinit* field of
- * the *pci_drv* structure.
- * During the PCI probing phase, the rte_eth_dev_init() function is
- * invoked for each PCI [Ethernet device] matching the embedded PCI
- * identifiers provided by the driver.
- */
-void
-rte_eth_driver_register(struct eth_driver *eth_drv)
-{
-	eth_drv->pci_drv.devinit = rte_eth_dev_init;
-	eth_drv->pci_drv.devuninit = rte_eth_dev_uninit;
-	rte_eal_pci_register(&eth_drv->pci_drv);
-}
-
 int
 rte_eth_dev_is_valid_port(uint8_t port_id)
 {
@@ -383,27 +399,6 @@ uint8_t
 rte_eth_dev_count(void)
 {
 	return nb_ports;
-}
-
-static enum rte_eth_dev_type
-rte_eth_dev_get_device_type(uint8_t port_id)
-{
-	RTE_ETH_VALID_PORTID_OR_ERR_RET(port_id, RTE_ETH_DEV_UNKNOWN);
-	return rte_eth_devices[port_id].dev_type;
-}
-
-static int
-rte_eth_dev_get_addr_by_port(uint8_t port_id, struct rte_pci_addr *addr)
-{
-	RTE_ETH_VALID_PORTID_OR_ERR_RET(port_id, -EINVAL);
-
-	if (addr == NULL) {
-		RTE_PMD_DEBUG_TRACE("Null pointer is specified\n");
-		return -EINVAL;
-	}
-
-	*addr = rte_eth_devices[port_id].pci_dev->addr;
-	return 0;
 }
 
 int
@@ -435,40 +430,15 @@ rte_eth_dev_get_port_by_name(const char *name, uint8_t *port_id)
 		return -EINVAL;
 	}
 
+	if (!nb_ports)
+		return -ENODEV;
+
 	*port_id = RTE_MAX_ETHPORTS;
 
 	for (i = 0; i < RTE_MAX_ETHPORTS; i++) {
 
 		if (!strncmp(name,
 			rte_eth_dev_data[i].name, strlen(name))) {
-
-			*port_id = i;
-
-			return 0;
-		}
-	}
-	return -ENODEV;
-}
-
-static int
-rte_eth_dev_get_port_by_addr(const struct rte_pci_addr *addr, uint8_t *port_id)
-{
-	int i;
-	struct rte_pci_device *pci_dev = NULL;
-
-	if (addr == NULL) {
-		RTE_PMD_DEBUG_TRACE("Null pointer is specified\n");
-		return -EINVAL;
-	}
-
-	*port_id = RTE_MAX_ETHPORTS;
-
-	for (i = 0; i < RTE_MAX_ETHPORTS; i++) {
-
-		pci_dev = rte_eth_devices[i].pci_dev;
-
-		if (pci_dev &&
-			!rte_eal_compare_pci_addr(&pci_dev->addr, addr)) {
 
 			*port_id = i;
 
@@ -503,127 +473,49 @@ rte_eth_dev_is_detachable(uint8_t port_id)
 		return 1;
 }
 
-/* attach the new physical device, then store port_id of the device */
-static int
-rte_eth_dev_attach_pdev(struct rte_pci_addr *addr, uint8_t *port_id)
-{
-	/* re-construct pci_device_list */
-	if (rte_eal_pci_scan())
-		goto err;
-	/* Invoke probe func of the driver can handle the new device. */
-	if (rte_eal_pci_probe_one(addr))
-		goto err;
-
-	if (rte_eth_dev_get_port_by_addr(addr, port_id))
-		goto err;
-
-	return 0;
-err:
-	return -1;
-}
-
-/* detach the new physical device, then store pci_addr of the device */
-static int
-rte_eth_dev_detach_pdev(uint8_t port_id, struct rte_pci_addr *addr)
-{
-	struct rte_pci_addr freed_addr;
-	struct rte_pci_addr vp;
-
-	/* get pci address by port id */
-	if (rte_eth_dev_get_addr_by_port(port_id, &freed_addr))
-		goto err;
-
-	/* Zeroed pci addr means the port comes from virtual device */
-	vp.domain = vp.bus = vp.devid = vp.function = 0;
-	if (rte_eal_compare_pci_addr(&vp, &freed_addr) == 0)
-		goto err;
-
-	/* invoke devuninit func of the pci driver,
-	 * also remove the device from pci_device_list */
-	if (rte_eal_pci_detach(&freed_addr))
-		goto err;
-
-	*addr = freed_addr;
-	return 0;
-err:
-	return -1;
-}
-
-/* attach the new virtual device, then store port_id of the device */
-static int
-rte_eth_dev_attach_vdev(const char *vdevargs, uint8_t *port_id)
-{
-	char *name = NULL, *args = NULL;
-	int ret = -1;
-
-	/* parse vdevargs, then retrieve device name and args */
-	if (rte_eal_parse_devargs_str(vdevargs, &name, &args))
-		goto end;
-
-	/* walk around dev_driver_list to find the driver of the device,
-	 * then invoke probe function of the driver.
-	 * rte_eal_vdev_init() updates port_id allocated after
-	 * initialization.
-	 */
-	if (rte_eal_vdev_init(name, args))
-		goto end;
-
-	if (rte_eth_dev_get_port_by_name(name, port_id))
-		goto end;
-
-	ret = 0;
-end:
-	free(name);
-	free(args);
-
-	return ret;
-}
-
-/* detach the new virtual device, then store the name of the device */
-static int
-rte_eth_dev_detach_vdev(uint8_t port_id, char *vdevname)
-{
-	char name[RTE_ETH_NAME_MAX_LEN];
-
-	/* get device name by port id */
-	if (rte_eth_dev_get_name_by_port(port_id, name))
-		goto err;
-	/* walk around dev_driver_list to find the driver of the device,
-	 * then invoke uninit function of the driver */
-	if (rte_eal_vdev_uninit(name))
-		goto err;
-
-	strncpy(vdevname, name, sizeof(name));
-	return 0;
-err:
-	return -1;
-}
-
 /* attach the new device, then store port_id of the device */
 int
 rte_eth_dev_attach(const char *devargs, uint8_t *port_id)
 {
-	struct rte_pci_addr addr;
 	int ret = -1;
+	int current = rte_eth_dev_count();
+	char *name = NULL;
+	char *args = NULL;
 
 	if ((devargs == NULL) || (port_id == NULL)) {
 		ret = -EINVAL;
 		goto err;
 	}
 
-	if (eal_parse_pci_DomBDF(devargs, &addr) == 0) {
-		ret = rte_eth_dev_attach_pdev(&addr, port_id);
-		if (ret < 0)
-			goto err;
-	} else {
-		ret = rte_eth_dev_attach_vdev(devargs, port_id);
-		if (ret < 0)
-			goto err;
+	/* parse devargs, then retrieve device name and args */
+	if (rte_eal_parse_devargs_str(devargs, &name, &args))
+		goto err;
+
+	ret = rte_eal_dev_attach(name, args);
+	if (ret < 0)
+		goto err;
+
+	/* no point looking at the port count if no port exists */
+	if (!rte_eth_dev_count()) {
+		RTE_LOG(ERR, EAL, "No port found for device (%s)\n", name);
+		ret = -1;
+		goto err;
 	}
 
-	return 0;
+	/* if nothing happened, there is a bug here, since some driver told us
+	 * it did attach a device, but did not create a port.
+	 */
+	if (current == rte_eth_dev_count()) {
+		ret = -1;
+		goto err;
+	}
+
+	*port_id = eth_dev_last_created_port;
+	ret = 0;
+
 err:
-	RTE_LOG(ERR, EAL, "Driver, cannot attach the device\n");
+	free(name);
+	free(args);
 	return ret;
 }
 
@@ -631,7 +523,6 @@ err:
 int
 rte_eth_dev_detach(uint8_t port_id, char *name)
 {
-	struct rte_pci_addr addr;
 	int ret = -1;
 
 	if (name == NULL) {
@@ -639,33 +530,19 @@ rte_eth_dev_detach(uint8_t port_id, char *name)
 		goto err;
 	}
 
-	/* check whether the driver supports detach feature, or not */
+	/* FIXME: move this to eal, once device flags are relocated there */
 	if (rte_eth_dev_is_detachable(port_id))
 		goto err;
 
-	if (rte_eth_dev_get_device_type(port_id) == RTE_ETH_DEV_PCI) {
-		ret = rte_eth_dev_get_addr_by_port(port_id, &addr);
-		if (ret < 0)
-			goto err;
-
-		ret = rte_eth_dev_detach_pdev(port_id, &addr);
-		if (ret < 0)
-			goto err;
-
-		snprintf(name, RTE_ETH_NAME_MAX_LEN,
-			"%04x:%02x:%02x.%d",
-			addr.domain, addr.bus,
-			addr.devid, addr.function);
-	} else {
-		ret = rte_eth_dev_detach_vdev(port_id, name);
-		if (ret < 0)
-			goto err;
-	}
+	snprintf(name, sizeof(rte_eth_devices[port_id].data->name),
+		 "%s", rte_eth_devices[port_id].data->name);
+	ret = rte_eal_dev_detach(name);
+	if (ret < 0)
+		goto err;
 
 	return 0;
 
 err:
-	RTE_LOG(ERR, EAL, "Driver, cannot detach the device\n");
 	return ret;
 }
 
@@ -1523,8 +1400,10 @@ get_xstats_count(uint8_t port_id)
 	} else
 		count = 0;
 	count += RTE_NB_STATS;
-	count += dev->data->nb_rx_queues * RTE_NB_RXQ_STATS;
-	count += dev->data->nb_tx_queues * RTE_NB_TXQ_STATS;
+	count += RTE_MIN(dev->data->nb_rx_queues, RTE_ETHDEV_QUEUE_STAT_CNTRS) *
+		 RTE_NB_RXQ_STATS;
+	count += RTE_MIN(dev->data->nb_tx_queues, RTE_ETHDEV_QUEUE_STAT_CNTRS) *
+		 RTE_NB_TXQ_STATS;
 	return count;
 }
 
@@ -1538,6 +1417,7 @@ rte_eth_xstats_get_names(uint8_t port_id,
 	int cnt_expected_entries;
 	int cnt_driver_entries;
 	uint32_t idx, id_queue;
+	uint16_t num_q;
 
 	cnt_expected_entries = get_xstats_count(port_id);
 	if (xstats_names == NULL || cnt_expected_entries < 0 ||
@@ -1554,7 +1434,8 @@ rte_eth_xstats_get_names(uint8_t port_id,
 			"%s", rte_stats_strings[idx].name);
 		cnt_used_entries++;
 	}
-	for (id_queue = 0; id_queue < dev->data->nb_rx_queues; id_queue++) {
+	num_q = RTE_MIN(dev->data->nb_rx_queues, RTE_ETHDEV_QUEUE_STAT_CNTRS);
+	for (id_queue = 0; id_queue < num_q; id_queue++) {
 		for (idx = 0; idx < RTE_NB_RXQ_STATS; idx++) {
 			snprintf(xstats_names[cnt_used_entries].name,
 				sizeof(xstats_names[0].name),
@@ -1564,7 +1445,8 @@ rte_eth_xstats_get_names(uint8_t port_id,
 		}
 
 	}
-	for (id_queue = 0; id_queue < dev->data->nb_tx_queues; id_queue++) {
+	num_q = RTE_MIN(dev->data->nb_tx_queues, RTE_ETHDEV_QUEUE_STAT_CNTRS);
+	for (id_queue = 0; id_queue < num_q; id_queue++) {
 		for (idx = 0; idx < RTE_NB_TXQ_STATS; idx++) {
 			snprintf(xstats_names[cnt_used_entries].name,
 				sizeof(xstats_names[0].name),
@@ -1600,14 +1482,18 @@ rte_eth_xstats_get(uint8_t port_id, struct rte_eth_xstat *xstats,
 	unsigned count = 0, i, q;
 	signed xcount = 0;
 	uint64_t val, *stats_ptr;
+	uint16_t nb_rxqs, nb_txqs;
 
 	RTE_ETH_VALID_PORTID_OR_ERR_RET(port_id, -EINVAL);
 
 	dev = &rte_eth_devices[port_id];
 
+	nb_rxqs = RTE_MIN(dev->data->nb_rx_queues, RTE_ETHDEV_QUEUE_STAT_CNTRS);
+	nb_txqs = RTE_MIN(dev->data->nb_tx_queues, RTE_ETHDEV_QUEUE_STAT_CNTRS);
+
 	/* Return generic statistics */
-	count = RTE_NB_STATS + (dev->data->nb_rx_queues * RTE_NB_RXQ_STATS) +
-		(dev->data->nb_tx_queues * RTE_NB_TXQ_STATS);
+	count = RTE_NB_STATS + (nb_rxqs * RTE_NB_RXQ_STATS) +
+		(nb_txqs * RTE_NB_TXQ_STATS);
 
 	/* implemented by the driver */
 	if (dev->dev_ops->xstats_get != NULL) {
@@ -1638,7 +1524,7 @@ rte_eth_xstats_get(uint8_t port_id, struct rte_eth_xstat *xstats,
 	}
 
 	/* per-rxq stats */
-	for (q = 0; q < dev->data->nb_rx_queues; q++) {
+	for (q = 0; q < nb_rxqs; q++) {
 		for (i = 0; i < RTE_NB_RXQ_STATS; i++) {
 			stats_ptr = RTE_PTR_ADD(&eth_stats,
 					rte_rxq_stats_strings[i].offset +
@@ -1649,7 +1535,7 @@ rte_eth_xstats_get(uint8_t port_id, struct rte_eth_xstat *xstats,
 	}
 
 	/* per-txq stats */
-	for (q = 0; q < dev->data->nb_tx_queues; q++) {
+	for (q = 0; q < nb_txqs; q++) {
 		for (i = 0; i < RTE_NB_TXQ_STATS; i++) {
 			stats_ptr = RTE_PTR_ADD(&eth_stats,
 					rte_txq_stats_strings[i].offset +
@@ -1659,8 +1545,11 @@ rte_eth_xstats_get(uint8_t port_id, struct rte_eth_xstat *xstats,
 		}
 	}
 
-	for (i = 0; i < count + xcount; i++)
+	for (i = 0; i < count; i++)
 		xstats[i].id = i;
+	/* add an offset to driver-specific stats */
+	for ( ; i < count + xcount; i++)
+		xstats[i].id += count;
 
 	return count + xcount;
 }
@@ -2689,7 +2578,7 @@ rte_eth_dev_callback_unregister(uint8_t port_id,
 
 void
 _rte_eth_dev_callback_process(struct rte_eth_dev *dev,
-	enum rte_eth_event_type event)
+	enum rte_eth_event_type event, void *cb_arg)
 {
 	struct rte_eth_dev_callback *cb_lst;
 	struct rte_eth_dev_callback dev_cb;
@@ -2700,6 +2589,9 @@ _rte_eth_dev_callback_process(struct rte_eth_dev *dev,
 			continue;
 		dev_cb = *cb_lst;
 		cb_lst->active = 1;
+		if (cb_arg != NULL)
+			dev_cb.cb_arg = (void *) cb_arg;
+
 		rte_spinlock_unlock(&rte_eth_dev_cb_lock);
 		dev_cb.cb_fn(dev->data->port_id, dev_cb.event,
 						dev_cb.cb_arg);
@@ -2749,7 +2641,7 @@ rte_eth_dma_zone_reserve(const struct rte_eth_dev *dev, const char *ring_name,
 	const struct rte_memzone *mz;
 
 	snprintf(z_name, sizeof(z_name), "%s_%s_%d_%d",
-		 dev->driver->pci_drv.name, ring_name,
+		 dev->driver->pci_drv.driver.name, ring_name,
 		 dev->data->port_id, queue_id);
 
 	mz = rte_memzone_lookup(z_name);
@@ -3390,8 +3282,8 @@ rte_eth_copy_pci_info(struct rte_eth_dev *eth_dev, struct rte_pci_device *pci_de
 		eth_dev->data->dev_flags |= RTE_ETH_DEV_DETACHABLE;
 
 	eth_dev->data->kdrv = pci_dev->kdrv;
-	eth_dev->data->numa_node = pci_dev->numa_node;
-	eth_dev->data->drv_name = pci_dev->driver->name;
+	eth_dev->data->numa_node = pci_dev->device.numa_node;
+	eth_dev->data->drv_name = pci_dev->driver->driver.name;
 }
 
 int

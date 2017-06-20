@@ -176,11 +176,11 @@ static const struct rte_i40evf_xstats_name_off rte_i40evf_stats_strings[] = {
 	{"rx_unknown_protocol_packets", offsetof(struct i40e_eth_stats,
 		rx_unknown_protocol)},
 	{"tx_bytes", offsetof(struct i40e_eth_stats, tx_bytes)},
-	{"tx_unicast_packets", offsetof(struct i40e_eth_stats, tx_bytes)},
-	{"tx_multicast_packets", offsetof(struct i40e_eth_stats, tx_bytes)},
-	{"tx_broadcast_packets", offsetof(struct i40e_eth_stats, tx_bytes)},
-	{"tx_dropped_packets", offsetof(struct i40e_eth_stats, tx_bytes)},
-	{"tx_error_packets", offsetof(struct i40e_eth_stats, tx_bytes)},
+	{"tx_unicast_packets", offsetof(struct i40e_eth_stats, tx_unicast)},
+	{"tx_multicast_packets", offsetof(struct i40e_eth_stats, tx_multicast)},
+	{"tx_broadcast_packets", offsetof(struct i40e_eth_stats, tx_broadcast)},
+	{"tx_dropped_packets", offsetof(struct i40e_eth_stats, tx_discards)},
+	{"tx_error_packets", offsetof(struct i40e_eth_stats, tx_errors)},
 };
 
 #define I40EVF_NB_XSTATS (sizeof(rte_i40evf_stats_strings) / \
@@ -361,6 +361,7 @@ i40evf_execute_vf_cmd(struct rte_eth_dev *dev, struct vf_cmd_info *args)
 		err = -1;
 		do {
 			ret = i40evf_read_pfmsg(dev, &info);
+			vf->cmd_retval = info.result;
 			if (ret == I40EVF_MSG_CMD) {
 				err = 0;
 				break;
@@ -965,7 +966,7 @@ i40evf_get_statics(struct rte_eth_dev *dev, struct rte_eth_stats *stats)
 						pstats->rx_broadcast;
 	stats->opackets = pstats->tx_broadcast + pstats->tx_multicast +
 						pstats->tx_unicast;
-	stats->ierrors = pstats->rx_discards;
+	stats->imissed = pstats->rx_discards;
 	stats->oerrors = pstats->tx_errors + pstats->tx_discards;
 	stats->ibytes = pstats->rx_bytes;
 	stats->obytes = pstats->tx_bytes;
@@ -1314,7 +1315,7 @@ i40evf_handle_pf_event(__rte_unused struct rte_eth_dev *dev,
 	switch (pf_msg->event) {
 	case I40E_VIRTCHNL_EVENT_RESET_IMPENDING:
 		PMD_DRV_LOG(DEBUG, "VIRTCHNL_EVENT_RESET_IMPENDING event\n");
-		_rte_eth_dev_callback_process(dev, RTE_ETH_EVENT_INTR_RESET);
+		_rte_eth_dev_callback_process(dev, RTE_ETH_EVENT_INTR_RESET, NULL);
 		break;
 	case I40E_VIRTCHNL_EVENT_LINK_CHANGE:
 		PMD_DRV_LOG(DEBUG, "VIRTCHNL_EVENT_LINK_CHANGE event\n");
@@ -1336,8 +1337,9 @@ i40evf_handle_aq_msg(struct rte_eth_dev *dev)
 	struct i40e_hw *hw = I40E_DEV_PRIVATE_TO_HW(dev->data->dev_private);
 	struct i40e_vf *vf = I40EVF_DEV_PRIVATE_TO_VF(dev->data->dev_private);
 	struct i40e_arq_event_info info;
-	struct i40e_virtchnl_msg *v_msg;
-	uint16_t pending, opcode;
+	uint16_t pending, aq_opc;
+	enum i40e_virtchnl_ops msg_opc;
+	enum i40e_status_code msg_ret;
 	int ret;
 
 	info.buf_len = I40E_AQ_BUF_SZ;
@@ -1346,7 +1348,6 @@ i40evf_handle_aq_msg(struct rte_eth_dev *dev)
 		return;
 	}
 	info.msg_buf = vf->aq_resp;
-	v_msg = (struct i40e_virtchnl_msg *)&info.desc;
 
 	pending = 1;
 	while (pending) {
@@ -1357,32 +1358,39 @@ i40evf_handle_aq_msg(struct rte_eth_dev *dev)
 				    "ret: %d", ret);
 			break;
 		}
-		opcode = rte_le_to_cpu_16(info.desc.opcode);
-
-		switch (opcode) {
+		aq_opc = rte_le_to_cpu_16(info.desc.opcode);
+		/* For the message sent from pf to vf, opcode is stored in
+		 * cookie_high of struct i40e_aq_desc, while return error code
+		 * are stored in cookie_low, Which is done by
+		 * i40e_aq_send_msg_to_vf in PF driver.*/
+		msg_opc = (enum i40e_virtchnl_ops)rte_le_to_cpu_32(
+						  info.desc.cookie_high);
+		msg_ret = (enum i40e_status_code)rte_le_to_cpu_32(
+						  info.desc.cookie_low);
+		switch (aq_opc) {
 		case i40e_aqc_opc_send_msg_to_vf:
-			if (v_msg->v_opcode == I40E_VIRTCHNL_OP_EVENT)
+			if (msg_opc == I40E_VIRTCHNL_OP_EVENT)
 				/* process event*/
 				i40evf_handle_pf_event(dev, info.msg_buf,
 						       info.msg_len);
 			else {
 				/* read message and it's expected one */
-				if (v_msg->v_opcode == vf->pend_cmd) {
-					vf->cmd_retval = v_msg->v_retval;
+				if (msg_opc == vf->pend_cmd) {
+					vf->cmd_retval = msg_ret;
 					/* prevent compiler reordering */
 					rte_compiler_barrier();
 					_clear_cmd(vf);
 				} else
 					PMD_DRV_LOG(ERR, "command mismatch,"
 						"expect %u, get %u",
-						vf->pend_cmd, v_msg->v_opcode);
+						vf->pend_cmd, msg_opc);
 				PMD_DRV_LOG(DEBUG, "adminq response is received,"
-					     " opcode = %d\n", v_msg->v_opcode);
+					     " opcode = %d\n", msg_opc);
 			}
 			break;
 		default:
 			PMD_DRV_LOG(ERR, "Request %u is not supported yet",
-				    opcode);
+				    aq_opc);
 			break;
 		}
 	}
@@ -1527,38 +1535,18 @@ i40evf_dev_uninit(struct rte_eth_dev *eth_dev)
  */
 static struct eth_driver rte_i40evf_pmd = {
 	.pci_drv = {
-		.name = "rte_i40evf_pmd",
 		.id_table = pci_id_i40evf_map,
 		.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_DETACHABLE,
+		.probe = rte_eth_dev_pci_probe,
+		.remove = rte_eth_dev_pci_remove,
 	},
 	.eth_dev_init = i40evf_dev_init,
 	.eth_dev_uninit = i40evf_dev_uninit,
 	.dev_private_size = sizeof(struct i40e_adapter),
 };
 
-/*
- * VF Driver initialization routine.
- * Invoked one at EAL init time.
- * Register itself as the [Virtual Poll Mode] Driver of PCI Fortville devices.
- */
-static int
-rte_i40evf_pmd_init(const char *name __rte_unused,
-		    const char *params __rte_unused)
-{
-	PMD_INIT_FUNC_TRACE();
-
-	rte_eth_driver_register(&rte_i40evf_pmd);
-
-	return 0;
-}
-
-static struct rte_driver rte_i40evf_driver = {
-	.type = PMD_PDEV,
-	.init = rte_i40evf_pmd_init,
-};
-
-PMD_REGISTER_DRIVER(rte_i40evf_driver, i40evf);
-DRIVER_REGISTER_PCI_TABLE(i40evf, pci_id_i40evf_map);
+RTE_PMD_REGISTER_PCI(net_i40e_vf, rte_i40evf_pmd.pci_drv);
+RTE_PMD_REGISTER_PCI_TABLE(net_i40e_vf, pci_id_i40evf_map);
 
 static int
 i40evf_dev_configure(struct rte_eth_dev *dev)
@@ -2539,8 +2527,11 @@ i40evf_hw_rss_hash_set(struct i40e_vf *vf, struct rte_eth_rss_conf *rss_conf)
 	rss_hf = rss_conf->rss_hf;
 	hena = (uint64_t)i40e_read_rx_ctl(hw, I40E_VFQF_HENA(0));
 	hena |= ((uint64_t)i40e_read_rx_ctl(hw, I40E_VFQF_HENA(1))) << 32;
-	hena &= ~I40E_RSS_HENA_ALL;
-	hena |= i40e_config_hena(rss_hf);
+	if (hw->mac.type == I40E_MAC_X722)
+		hena &= ~I40E_RSS_HENA_ALL_X722;
+	else
+		hena &= ~I40E_RSS_HENA_ALL;
+	hena |= i40e_config_hena(rss_hf, hw->mac.type);
 	i40e_write_rx_ctl(hw, I40E_VFQF_HENA(0), (uint32_t)hena);
 	i40e_write_rx_ctl(hw, I40E_VFQF_HENA(1), (uint32_t)(hena >> 32));
 	I40EVF_WRITE_FLUSH(hw);
@@ -2556,7 +2547,10 @@ i40evf_disable_rss(struct i40e_vf *vf)
 
 	hena = (uint64_t)i40e_read_rx_ctl(hw, I40E_VFQF_HENA(0));
 	hena |= ((uint64_t)i40e_read_rx_ctl(hw, I40E_VFQF_HENA(1))) << 32;
-	hena &= ~I40E_RSS_HENA_ALL;
+	if (hw->mac.type == I40E_MAC_X722)
+		hena &= ~I40E_RSS_HENA_ALL_X722;
+	else
+		hena &= ~I40E_RSS_HENA_ALL;
 	i40e_write_rx_ctl(hw, I40E_VFQF_HENA(0), (uint32_t)hena);
 	i40e_write_rx_ctl(hw, I40E_VFQF_HENA(1), (uint32_t)(hena >> 32));
 	I40EVF_WRITE_FLUSH(hw);
@@ -2617,7 +2611,9 @@ i40evf_dev_rss_hash_update(struct rte_eth_dev *dev,
 
 	hena = (uint64_t)i40e_read_rx_ctl(hw, I40E_VFQF_HENA(0));
 	hena |= ((uint64_t)i40e_read_rx_ctl(hw, I40E_VFQF_HENA(1))) << 32;
-	if (!(hena & I40E_RSS_HENA_ALL)) { /* RSS disabled */
+	if (!(hena & ((hw->mac.type == I40E_MAC_X722)
+		 ? I40E_RSS_HENA_ALL_X722
+		 : I40E_RSS_HENA_ALL))) { /* RSS disabled */
 		if (rss_hf != 0) /* Enable RSS */
 			return -EINVAL;
 		return 0;

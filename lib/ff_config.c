@@ -143,8 +143,18 @@ port_cfg_handler(struct ff_config *cfg, const char *section,
         cur->name = strdup(section);
         cur->port_id = portid;
     }
-
-    if (strcmp(name, "addr") == 0) {
+    if (strcmp(name, "interface") == 0) {
+        if (strncmp(value, "eth_bond", strlen("eth_bond")) == 0) {
+             cur->dpdk_bond = strdup(value);
+             cur->port_type = PORT_TYPE_BOND;
+             int port_id;
+             int ret = sscanf(cur->dpdk_bond, "eth_bond%d", &port_id);
+             cur->port_id = port_id;
+        }else {
+             cur->pci_addr = strdup(value);
+             cur->port_type = PORT_TYPE_SINGLE;
+        }
+    }else if (strcmp(name, "addr") == 0) {
         cur->addr = strdup(value);
     } else if (strcmp(name, "netmask") == 0) {
         cur->netmask = strdup(value);
@@ -178,6 +188,8 @@ handler(void* user, const char* section, const char* name,
         pconfig->dpdk.lcore_mask = strdup(value);
     } else if (MATCH("dpdk", "port_mask")) {
         pconfig->dpdk.port_mask = atoi(value);
+    } else if (MATCH("dpdk", "dpdk_bond")) {
+        pconfig->dpdk.dpdk_bond = strdup(value);
     } else if (MATCH("dpdk", "nb_ports")) {
         pconfig->dpdk.nb_ports = atoi(value);
     } else if (MATCH("dpdk", "promiscuous")) {
@@ -232,6 +244,15 @@ dpdk_argc_argv_setup(struct ff_config *cfg)
     if (cfg->dpdk.memory) {
         sprintf(temp, "-m%d", cfg->dpdk.memory);
         dpdk_argv[n++] = strdup(temp);
+    }
+    
+    for (i = 0; i < cfg->dpdk.nb_ports; i++) {
+        struct ff_port_cfg *pc = &cfg->dpdk.port_cfgs[i];
+        if (pc->dpdk_bond) {
+            sprintf(temp, "--vdev=%s", pc->dpdk_bond);
+            dpdk_argv[n++] = strdup(temp);
+        }
+
     }
 
     for(i = 0; i < dpdk_argc_arg; ++i) {

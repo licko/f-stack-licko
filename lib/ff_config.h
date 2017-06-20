@@ -28,8 +28,8 @@
 #define __FSTACK_CONFIG_H
 
 // dpdk argc, argv, max argc: 4, member of dpdk_config
-#define DPDK_CONFIG_NUM 4
-#define DPDK_CONFIG_MAXLEN 64
+#define DPDK_CONFIG_NUM 10
+#define DPDK_CONFIG_MAXLEN 64*2
 
 extern int dpdk_argc;
 extern char *dpdk_argv[DPDK_CONFIG_NUM + 1];
@@ -45,8 +45,14 @@ struct ff_hw_features {
 struct ff_port_cfg {
     char *name;
     uint8_t port_id;
+    uint8_t port_set;
+    uint8_t port_type;
+#define PORT_TYPE_BOND   1 
+#define PORT_TYPE_SINGLE 2    
     uint8_t mac[6];
     struct ff_hw_features hw_features;
+    char *dpdk_bond;
+    char *pci_addr;
     char *addr;
     char *netmask;
     char *broadcast;
@@ -71,7 +77,7 @@ struct ff_config {
         /* mask of enabled ports
          * use uint32_t because num of max ports is 32
          */
-        uint32_t port_mask;
+        uint32_t port_mask; 
         int nb_channel;
         int memory;
         int no_huge;

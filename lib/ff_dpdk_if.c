@@ -48,7 +48,8 @@
 #include <rte_ip.h>
 #include <rte_tcp.h>
 #include <rte_udp.h>
-
+#include <rte_arp.h>
+#include <rte_eth_bond.h>
 #include "ff_dpdk_if.h"
 #include "ff_dpdk_pcap.h"
 #include "ff_dpdk_kni.h"
@@ -343,7 +344,11 @@ parse_lcore_mask(const char *coremask, uint16_t *lcore_proc,
 static int
 init_lcore_conf(void)
 {
+    uint8_t j;
+    char buf[20];
+    uint8_t cfg_port_id;
     uint8_t nb_ports = rte_eth_dev_count();
+    uint8_t cfg_ports = ff_global_cfg.dpdk.nb_ports;
     if (nb_ports == 0) {
         rte_exit(EXIT_FAILURE, "No probed ethernet devices\n");
     }
@@ -378,11 +383,55 @@ init_lcore_conf(void)
             printf("\nSkipping disabled port %d\n", port_id);
             continue;
         }
-
+#if 0
         if (port_id >= ff_global_cfg.dpdk.nb_ports) {
             printf("\nSkipping non-configured port %d\n", port_id);
             break;
         }
+#endif        
+        struct rte_eth_dev_info dev_info;
+        rte_eth_dev_info_get(port_id, &dev_info);
+
+#if 1
+        cfg_port_id = 255;
+        
+        if (strncmp (dev_info.driver_name, "rte_bond_pmd", 12) == 0)
+          {
+             for (j = 0; j < cfg_ports; j++) {
+                 if (ff_global_cfg.dpdk.port_cfgs[j].port_id == port_id)     
+                     {
+                        cfg_port_id = j; 
+                        break;
+                     }
+            }
+          }
+        else
+          {
+            memset (buf, 0, 20);
+		    sprintf(buf, ""PCI_PRI_FMT"",
+			dev_info.pci_dev->addr.domain, dev_info.pci_dev->addr.bus, 
+			dev_info.pci_dev->addr.devid,  dev_info.pci_dev->addr.function);
+
+            for (j = 0; j < cfg_ports; j++) {
+                struct ff_port_cfg *pc = &ff_global_cfg.dpdk.port_cfgs[j];
+                if (pc->port_type == PORT_TYPE_SINGLE && (ff_global_cfg.dpdk.port_cfgs[j].port_set == 0))
+                  {
+                    if (strncmp (pc->pci_addr, buf, strlen(buf)) == 0)
+        	          {
+                        ff_global_cfg.dpdk.port_cfgs[j].port_id = port_id;
+                        ff_global_cfg.dpdk.port_cfgs[j].port_set = 1;
+                        cfg_port_id = j;
+                        break;
+                      }
+                  }           
+                
+            }
+          }
+        
+        if (cfg_port_id == 255)
+          continue; 
+        
+#endif
 
         uint16_t nb_rx_queue = lcore_conf.nb_rx_queue;
         lcore_conf.rx_queue_list[nb_rx_queue].port_id = port_id;
@@ -390,9 +439,9 @@ init_lcore_conf(void)
         lcore_conf.nb_rx_queue++;
 
         lcore_conf.tx_queue_id[port_id] = lcore_conf.proc_id;
-        lcore_conf.pcap[port_id] = ff_global_cfg.dpdk.port_cfgs[enabled_ports].pcap;
+        lcore_conf.pcap[port_id] = ff_global_cfg.dpdk.port_cfgs[cfg_port_id].pcap;
 
-        ff_global_cfg.dpdk.port_cfgs[enabled_ports].port_id = port_id;
+        ff_global_cfg.dpdk.port_cfgs[cfg_port_id].port_id = port_id;
 
         enabled_ports++;
     }
@@ -603,20 +652,81 @@ init_kni(void)
     return 0;
 }
 
+void
+ff_check_port()
+{
+    uint8_t j;
+    uint8_t port_id;
+    char buf[20];
+        
+    uint8_t nb_ports = ff_global_cfg.dpdk.nb_ports;
+    for (j = 0; j < nb_ports; j++) {
+        struct ff_port_cfg *pc = &ff_global_cfg.dpdk.port_cfgs[j];
+        port_id = ff_global_cfg.dpdk.port_cfgs[j].port_id;
+        if (pc->port_type == PORT_TYPE_BOND)
+          {
+            unsigned char slink[16];
+        	int nlink = rte_eth_bond_slaves_get (port_id, slink, 16);
+            if (nlink > 0)
+              {
+                struct rte_eth_dev_info slave_dev_info;
+                rte_eth_dev_info_get(slink[0], &slave_dev_info);
+                memset (buf, 0, 20);
+                
+    		    sprintf(buf, ""PCI_PRI_FMT"",
+    			slave_dev_info.pci_dev->addr.domain, slave_dev_info.pci_dev->addr.bus, 
+    			slave_dev_info.pci_dev->addr.devid,  slave_dev_info.pci_dev->addr.function);
+    
+
+                if (strstr (pc->dpdk_bond, buf) != NULL)
+    	          {
+                    printf("---match bond----->[%s]:[%d] j = %d port_id = %d\n", __func__, __LINE__, j, port_id);
+                  }
+              }
+
+          }
+        else if (pc->port_type == PORT_TYPE_SINGLE) 
+          {
+                struct rte_eth_dev_info dev_info;
+                
+                rte_eth_dev_info_get(port_id, &dev_info);
+                memset (buf, 0, 20);
+                
+    		    sprintf(buf, ""PCI_PRI_FMT"",
+    			dev_info.pci_dev->addr.domain, dev_info.pci_dev->addr.bus, 
+    			dev_info.pci_dev->addr.devid,  dev_info.pci_dev->addr.function);
+    
+                if (strncmp (pc->pci_addr, buf, strlen(buf)) == 0)
+    	          {
+                    printf("---match----->[%s]:[%d] j = %d port_id = %d\n", __func__, __LINE__, j, port_id);
+                  }
+          }           
+                  
+    }
+} 
+
 static int
 init_port_start(void)
 {
-    int nb_ports = ff_global_cfg.dpdk.nb_ports;
+    uint8_t nb_ports = ff_global_cfg.dpdk.nb_ports;
     uint16_t nb_procs = ff_global_cfg.dpdk.nb_procs;
     unsigned socketid = rte_lcore_to_socket_id(rte_lcore_id());
     struct rte_mempool *mbuf_pool = pktmbuf_pool[socketid];
-    uint16_t i;
-
-    for (i = 0; i < nb_ports; i++) {
+    uint8_t  i;
+    
+    for (i = 0; i < nb_ports;  i++) {
         uint8_t port_id = ff_global_cfg.dpdk.port_cfgs[i].port_id;
-
         struct rte_eth_dev_info dev_info;
+        
         rte_eth_dev_info_get(port_id, &dev_info);
+
+#if 1
+        if (strncmp (dev_info.driver_name, "rte_bond_pmd", 12) == 0)
+    	  {
+            dev_info.rx_offload_capa |= DEV_RX_OFFLOAD_VLAN_STRIP;
+            dev_info.tx_offload_capa |= DEV_TX_OFFLOAD_VLAN_INSERT;
+          }
+#endif
 
         if (nb_procs > dev_info.max_rx_queues) {
             rte_exit(EXIT_FAILURE, "num_procs[%d] bigger than max_rx_queues[%d]\n",
@@ -751,6 +861,47 @@ init_port_start(void)
             }
         }
 
+        if (strncmp (dev_info.driver_name, "rte_bond_pmd", 12) == 0)
+    	  {
+       
+            unsigned char slink[16];
+        	int nlink = rte_eth_bond_slaves_get (port_id, slink, 16);
+            if (nlink > 0)
+        		  {
+        		    int rv;
+                    unsigned char addr[6];
+        		    /* Get MAC of 1st slave link */
+        		    rte_eth_macaddr_get (slink[0],
+        					 (struct ether_addr *) addr);
+                    printf("Port %u MAC: %02" PRIx8 " %02" PRIx8 " %02" PRIx8
+                        " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 "\n",
+                                             (unsigned)port_id,
+                                             addr[0], addr[1],
+                                             addr[2], addr[3],
+                                             addr[4], addr[5]);
+                    
+        		    /* Set MAC of bounded interface to that of 1st slave link */
+        		    rv =
+        		      rte_eth_bond_mac_address_set (port_id,
+        						    (struct ether_addr *)
+        							    addr);
+                    if (rv < 0)
+        		      rte_exit(EXIT_FAILURE, "Failed to set MAC address");
+                  }
+    
+            rte_eth_macaddr_get(port_id, &addr);
+            printf("Port %u MAC: %02" PRIx8 " %02" PRIx8 " %02" PRIx8
+                        " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 "\n",
+            (unsigned)port_id,
+            addr.addr_bytes[0], addr.addr_bytes[1],
+            addr.addr_bytes[2], addr.addr_bytes[3],
+            addr.addr_bytes[4], addr.addr_bytes[5]);
+            rte_memcpy(ff_global_cfg.dpdk.port_cfgs[i].mac,
+                addr.addr_bytes, ETHER_ADDR_LEN);
+          }
+        
+        ff_check_port();
+        
         ret = rte_eth_dev_start(port_id);
         if (ret < 0) {
             return ret;
