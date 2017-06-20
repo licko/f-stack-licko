@@ -188,8 +188,6 @@ handler(void* user, const char* section, const char* name,
         pconfig->dpdk.lcore_mask = strdup(value);
     } else if (MATCH("dpdk", "port_mask")) {
         pconfig->dpdk.port_mask = atoi(value);
-    } else if (MATCH("dpdk", "dpdk_bond")) {
-        pconfig->dpdk.dpdk_bond = strdup(value);
     } else if (MATCH("dpdk", "nb_ports")) {
         pconfig->dpdk.nb_ports = atoi(value);
     } else if (MATCH("dpdk", "promiscuous")) {
